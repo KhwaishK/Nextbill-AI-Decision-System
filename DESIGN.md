@@ -1,134 +1,126 @@
 # Design Notes
 
-## Approach
+## How I approached it
 
-I treated this as a 3-stage pipeline: **extract → classify → decide**.
+I split the problem into three simple steps, one message at a time:
 
-1. **Extract** structured entities (amounts, invoice/order/transaction
-   numbers, time references, a couple of boolean flags) from the raw text
-   using regex/keyword matching.
-2. **Classify** the message into one of five issue categories (or
-   `UNCERTAIN`) using keyword scoring, boosted by a few structural signals
-   from the extracted entities (e.g. two distinct amounts nudges the score
-   toward "partial payment mismatch").
-3. **Decide**, using a table of per-category business rules, whether the
-   case is automatable, whether it always needs a human regardless, what
-   information is missing, and what to do next — with a couple of
-   cross-cutting safety overrides (large amount, low classifier confidence)
-   applied on top of the per-category rules.
+1. **Pull out the facts** — amount, invoice number, order number, transaction
+   ID, anything mentioned like "yesterday". 
+2. **Figure out what kind of problem it is** — payment not showing up,
+   partial payment confusion, double charge, wrong name on invoice, or "I
+   don't know which invoice this is for." Done with keyword matching, not an
+   LLM.
+3. **Decide what to do about it** — can this be handled automatically, does
+   it need a human anyway, and what's missing before anything can happen.
+   This part is just a table of rules, one row per issue type.
 
-I kept every stage in independent, testable Python modules with a shared
-Pydantic schema between them (`app/models.py`), so any stage — most likely
-the classifier — can be replaced with an LLM-backed version later without
-changing anything else.
+That's it. No ML model, no LLM call in the main flow. Each of those three
+steps is its own file so any one of them could be swapped out later (say,
+step 2 becomes an LLM call) without touching the other two.
 
-## Important design decisions (and why)
+## The decisions that actually matter here
 
-**1. Claims from the customer are evidence, not facts.**
-Nowhere does the system take an action (mark paid, reverse a charge, reissue
-an invoice) purely because the customer said so. "Automatable" is always
-defined relative to *verifying the claim against a backend record* (a
-payment gateway, a ledger), not acting on the text directly. This is the
-single most important safety property of the design — an LLM-only system
-that reads "I paid ₹4,500" and just... marks the order paid, is a fraud
-vector.
+**The customer saying "I paid" doesn't mean they paid, at least not as far
+as the system is concerned.**
+This is probably the most important thing in the whole design. The system
+never marks an order as paid, reverses a charge, or fixes an invoice just
+because the message says so. All it ever says is "this could be checked
+automatically if we had a transaction ID to look up." If there's no way to
+verify a claim, it doesn't get acted on, it gets asked for more proof, or
+sent to a person. This is basically the whole point of not just handing
+this straight to an LLM and letting it "decide" things — it has no way to
+actually verify anything, it can only read words.
 
-**2. Automation-eligibility and human-review are separate, independent
-flags**, not two ends of the same switch.
-- `automatable` = "given the required verification data, could an automated
-  backend check resolve this with no human?" — purely a data/complexity
-  question.
-- `requires_human_review` = "should a human look at this anyway, because of
-  risk?" — a business/compliance/fraud question layered on top.
+**"Can this be automated" and "should a human look at it anyway" are two
+different questions, not one.**
+I kept these as two separate flags instead of one. Why? Because sometimes a
+case has all the data needed to be handled by a script, but you still don't
+want to let it run without a person's eyes on it. Example: someone getting
+charged twice. Even if we have both transaction IDs and everything lines up
+perfectly, I still send that to a human because it ends in a refund, and
+refunds are exactly the kind of thing you don't want a rule-based system
+approving on its own.
 
-A case can be automatable but still routed to a human (duplicate charges,
-name mismatches, large amounts). This mirrors how I'd actually want a real
-support system to behave: "could" and "should" are different questions.
+**Two blunt safety nets sit on top of everything else:**
+- Anything ₹20,000 or more automatically gets flagged for a human, no matter
+  what category it is. It's not a smart rule, it's a deliberately dumb one,
+  easy to explain to anyone, and it puts a ceiling on how bad an automated
+  mistake could get.
+- If the system genuinely isn't sure what category a message belongs to, it
+  doesn't guess, it just says "uncertain" and hands it to a person. I'd
+  rather it admit it doesn't know than confidently pick the wrong bucket.
 
-**3. Two independent safety overrides, applied regardless of category:**
-- **High amount (≥ ₹20,000)** always forces human review. This is a blunt
-  threshold, not learned, but it's explainable to a non-technical
-  stakeholder in one sentence, and it bounds the system's downside: even if
-  every other rule is wrong, a large-value mistake still gets caught.
-- **Low classification confidence (`UNCERTAIN`)** always forces human
-  review. An automated system should never act confidently on a case it
-  wasn't confident how to classify in the first place.
+**Why keywords instead of an LLM for classification.**
+There's only five categories here, and they're pretty distinct in the
+language people use to describe them. A short list of phrases per category
+gets every one of the five sample messages right, and this is the part I
+actually care about. I can point at exactly which words made it pick that
+category. No LLM API, no cost, no chance of it inventing something. The
+honest downside: it's bad at anything worded differently than expected
+slang, typos, mixed languages. I made sure to include a test case that
+shows this weakness rather than hide it (a Hinglish message that correctly
+comes back "uncertain" instead of getting misclassified with false
+confidence).
 
-**4. Rule-based classification over an LLM, for this task.**
-With only five known categories and small, controllable keyword lists, rules
-get full coverage of the given examples with zero hallucination risk and
-complete auditability (every classification names the exact phrases that
-triggered it). The trade-off — brittleness to paraphrasing/colloquial
-language — is real and is called out explicitly below and in the additional
-test cases (see message 6, the Hinglish example, which the current keyword
-list correctly fails to confidently classify rather than guessing wrong).
+**A bug I actually hit while testing, worth mentioning.**
+My first version of the "find the invoice number" regex grabbed whatever
+word came right after "invoice", so "invoice says ₹12,000" extracted
+"says" as if it were an invoice number. Found it by literally running the
+code on the sample messages and reading the output, not by staring at the
+regex. Fixed it by requiring the extracted text to contain a digit, since
+every real invoice number would have one anyway.
 
-**5. Regex-based entity extraction, with a caught bug worth mentioning.**
-My first version of the invoice/order regex matched *any* word following
-"invoice"/"order" (so "invoice says" extracted "says" as if it were an
-invoice number). I caught this by actually running the pipeline on the
-sample messages and inspecting the output rather than just reading the code
-— a reminder that entity extraction regexes need adversarial testing, not
-just "does it match the happy path." The fix requires the captured token to
-contain a digit, since every real identifier NextBill would issue does.
+## Assumptions I made
 
-## Assumptions
+- Money is always in rupees, written with a ₹ symbol. If it's written as
+  "Rs 9,000" or spelled out in words, the extractor won't catch it, that's
+  a known gap.
+- I'm assuming there's some actual backend somewhere (payment gateway,
+  ledger, whatever) that the "automatable" checks would call into. I didn't
+  build that backend. I only figured out whether calling it would make
+  sense for a given case.
+- The ₹20,000 cutoff for "always needs a human" is a number I picked to
+  make a point, not a real business threshold. A real one would come from
+  NextBill's actual risk appetite.
+- "Needs a human" just means it goes into a queue for someone to look at,
+  it doesn't mean the customer hears nothing back. In a real system you'd
+  still want an automatic "we're looking into it" reply sent immediately.
 
-- Currency is always INR and amounts are written with a "₹" symbol in the
-  primary path; amounts written as "Rs 9,000" or in words are a known gap
-  (see below), not handled by the regex extractor, though the pipeline still
-  behaves safely (missing entities → routed for more info / human review).
-- There is a backend (payment gateway API, ledger/reconciliation system)
-  that the "automatable" actions describe calling — this system does not
-  implement that backend, only decides *whether* such a call could resolve
-  the case if it existed.
-- The ₹20,000 high-value threshold is illustrative; a real deployment would
-  set this based on NextBill's actual fraud/chargeback risk tolerance and
-  average order value, not a number I picked.
-- "Human review" means routing to a support/finance agent queue with the
-  extracted entities and reasoning attached — not that the system stops
-  responding to the customer. In practice you'd still want an automatic
-  acknowledgment sent to the customer even for human-routed cases.
+## Where this system isn't confident, and I'm not pretending otherwise
 
-## Cases the system cannot confidently handle
+- **Messages that aren't written in plain English.** Hinglish, typos, heavy
+  slang, the keyword matching just won't catch it, and it'll (correctly,
+  but not helpfully) say "uncertain." Test case 6 shows this on purpose.
+- **Problems that aren't one of the five categories at all**  like a refund
+  that's taking too long. It'll land in "uncertain," which is safe, but the
+  system has no way of noticing "hey, this keeps happening, maybe it should
+  be its own category." That noticing has to happen by a person reviewing
+  the uncertain pile.
+- **One message, two problems.** If someone mentions a double charge *and*
+  says the amount was wrong, the system just picks one category and sends
+  it to a human which is safe, but it doesn't flag that there were
+  actually two separate issues bundled together.
+- **Amounts without the ₹ symbol.** "Rs 9,000" just won't get picked up as
+  an amount at all right now. The message still classifies fine off other
+  words in the text, but anything downstream that needed the actual number
+  (like matching an unmatched payment to an invoice by amount) wouldn't have
+  it.
 
-- **Colloquial / code-switched language** (e.g. Hinglish, heavy slang,
-  typos). The keyword classifier will often fall back to `UNCERTAIN` here,
-  which is the safe behavior but not a *good* one — see additional test
-  case 6.
-- **Genuinely new issue types** not in the five categories (e.g. refund
-  delays, subscription cancellation billing, currency conversion disputes —
-  see additional test case 4). These correctly land in `UNCERTAIN`, but the
-  system offers no automatic way to *notice* that a new category should be
-  created; that's a manual step for whoever reviews the `UNCERTAIN` queue.
-- **Compound messages** describing two distinct issues at once (see
-  additional test case 5: duplicate charge + wrong amount). The system picks
-  a single primary category and routes to a human, which is safe, but it
-  doesn't surface the second issue as a separate, trackable item.
-- **Amounts without the ₹ symbol** ("Rs 9,000", "9000 rupees") are invisible
-  to the current extractor (test case 7). The message still gets classified
-  correctly from other keywords, but downstream automation that depends on
-  amount matching (e.g. unmatched-payment reconciliation) would not have the
-  number it needs.
+## What I'd do next if I had more time
 
-## What I'd improve with more time
-
-1. **LLM fallback for low-confidence cases**, constrained to the same
-   `IssueCategory` enum via structured output/function calling, triggered
-   only when the rule-based classifier's confidence is below threshold —
-   keeping the fast/free/explainable path as the default and reserving the
-   LLM for exactly the paraphrase-robustness gap it's good at.
-2. **A feedback loop**: log every `UNCERTAIN` case and every
-   human-override, and periodically mine them for new keyword phrases or
-   entirely new categories, so the rule base actually improves from real
-   traffic instead of staying frozen at whatever I wrote today.
-3. **Better amount parsing**: handle "Rs", "INR", "rupees", and
-   written-out numbers, and reconcile multiple representations of the same
-   number in one message.
-4. **Multi-issue detection**: instead of forcing one category per message,
-   score all categories above a threshold and return a ranked list, so
-   compound complaints aren't silently reduced to a single label.
-5. **A thin FastAPI wrapper** exposing `POST /classify` for integration
-   testing with an actual support-ticketing frontend, plus a small
-   evaluation set with hand-labeled expected categories to track precision/
-   recall as the keyword lists evolve.
+1. Add an LLM as a **fallback**, not the main classifier only kick in when
+   the keyword approach isn't confident. I'd force its output to match the
+   same fixed set of categories rather than letting it return free text, so
+   it can't go off script.
+2. Actually log the "uncertain" cases and the ones a human overrides, and
+   go back through them periodically to add new keywords or even whole new
+   categories. Right now the rules are frozen at whatever I wrote today 
+   they should learn from real traffic over time.
+3. Handle more ways of writing amounts "Rs", "INR", spelled-out numbers 
+   and make sure duplicate mentions of the same amount don't get
+   double-counted.
+4. Let one message get tagged with more than one issue instead of forcing
+   everything into a single category.
+5. Wrap it in a small FastAPI endpoint so it could actually plug into a real
+   support tool, and build a small labeled test set to track accuracy as I
+   keep tweaking the keyword lists.
