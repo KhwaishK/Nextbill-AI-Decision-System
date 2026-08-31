@@ -1,11 +1,3 @@
-"""
-Run the pipeline over all test messages and print structured decisions.
-
-Usage:
-    python main.py                # run all given + additional test messages
-    python main.py "some message" # run a single custom message
-"""
-
 import json
 import sys
 from app.pipeline import process_message
