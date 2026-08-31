@@ -1,4 +1,4 @@
-# NextBill — AI Billing/Payment Message Decision System
+# NextBill AI Decision System
 
 A small system that reads a customer support message about a payment/billing
 issue and decides:
@@ -16,13 +16,13 @@ wrong invoice reissued, wrongly marking an order as paid). Given that, I
 optimized for **explainability and safety** over cleverness:
 
 - **Rule-based classification, not an LLM**, as the default. A keyword/regex
-  approach is fully auditable — for every decision I can point to the exact
+  approach is fully auditable for every decision I can point to the exact
   phrase or entity that produced it. It also fails safely: when nothing
   matches, confidence is 0 and the message is routed to a human, whereas an
   LLM will often confidently guess a category even when it shouldn't.
 - **The customer's claim is never trusted as fact.** "I paid ₹4,500" is
   evidence, not proof. The system never auto-changes a payment/order status
-  based on the text alone — it only ever says "this *could* be verified
+  based on the text alone, it only ever says "this *could* be verified
   automatically *if* a transaction reference is supplied," and separately
   decides whether a human must look at it regardless of whether that
   verification succeeds.
@@ -101,14 +101,14 @@ Each message produces output like:
 The system is structured so an LLM can be dropped in at two specific seams
 without touching the rest of the pipeline:
 
-1. **`app/classifier.py::classify_with_llm`** — a stub for using an LLM
+1. **`app/classifier.py::classify_with_llm`** - a stub for using an LLM
    (e.g. OpenAI/Azure OpenAI structured outputs or function calling) as a
    *fallback* when the rule-based classifier's confidence is below
    threshold, rather than as the primary classifier. The LLM's output should
    be constrained to the same `IssueCategory` enum and validated against it —
    if it returns anything outside the enum, treat it as `UNCERTAIN` rather
    than trusting it.
-2. **Entity extraction fallback** — for messages where amounts are written
+2. **Entity extraction fallback** - for messages where amounts are written
    in words ("twelve thousand rupees") or without symbols, an LLM extractor
    could run after the regex extractor, but its output should be
    cross-checked against digit sequences actually present in the raw text
@@ -117,5 +117,5 @@ without touching the rest of the pipeline:
 I deliberately did not wire up a live LLM call for this submission, both to
 avoid an API-key dependency for something this size, and because the rule
 engine already fully explains every one of the 5 given cases with 100%/high
-confidence — adding an LLM here wouldn't have demonstrated more judgement,
+confidence, adding an LLM here wouldn't have demonstrated more judgement,
 just more infrastructure.
